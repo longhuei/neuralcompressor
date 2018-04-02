@@ -4,11 +4,17 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
 
-import sys
-import os
-import time
-import math
 import numpy as np
+import pandas as pd
+
+import itertools
+from tqdm import tqdm
+from time import strftime
+
+import os
+import argparse
+import logging
+import pickle
 
 parser = argparse.ArgumentParser(description='EmbedQuantize')
 parser.add_argument('-M', type=int, default=20, help='number of subcodes')
@@ -43,7 +49,7 @@ parser.add_argument(
 parser.add_argument('--cuda', metavar='C', type=int, help='CUDA device to use')
 parser.add_argument(
     '--pretrained',
-    metavar='D',
+    metavar='P',
     type=str,
     default="data/glove.6B.300d.npy",
     help='pretrined word embeddings numpy array')
@@ -74,7 +80,7 @@ def gumbel_softmax_sample(logits, temperature):
 
 def gumbel_softmax(logits, temperature, hard=False):
     y = gumbel_softmax_sample(logits, temperature)
-    if hard:
+    if hard:  # not important here since never used lol
         # shape = y.size()
         # _, ind = y.max(dim=-1)
         # y_hard = torch.zeros_like(y).view(-1, shape[-1])
@@ -94,10 +100,14 @@ class EmbedQuantize(nn.Module):
         self.M = M
         self.num_centroids = 2**K
 
-        self.embed = nn.Embedding.from_pretrained(embedding_npy, freeze=True)
-        self.codebook = nn.Embedding(M * num_centroids, emb_size)
-        self.linear1 = nn.Linear(emb_size, M * num_centroids / 2)
-        self.linear2 = nn.Linear(M * num_centroids / 2, M * num_centroids)
+        # self.pretrained = nn.Embedding.from_pretrained(embedding_npy, freeze=True)  # next version
+        self.pretrained = nn.Embedding(vocab_size, emb_size)
+        self.pretrained.weight.data = torch.from_numpy(embedding_npy)
+        self.pretrained.weight.requires_grad = False
+        self.codebook = nn.Embedding(M * self.num_centroids, emb_size)
+        self.linear1 = nn.Linear(emb_size, M * self.num_centroids / 2)
+        self.linear2 = nn.Linear(M * self.num_centroids / 2,
+                                 M * self.num_centroids)
 
         nn.init.uniform_(self.embed.weight, a=-param_init, b=param_init)
         nn.init.uniform_(self.codebook.weight, a=-param_init, b=param_init)
@@ -106,11 +116,10 @@ class EmbedQuantize(nn.Module):
         nn.init.uniform_(self.linear2.weight, a=-param_init, b=param_init)
         nn.init.uniform_(self.linear1.bias, a=-param_init, b=param_init)
 
-    def forward(self, word_input=np.array([3, 4, 5]), tau=1.):
+    def forward(self, wordin=np.array([3, 4, 5]), tau=1.):
         tau -= 0.1
 
-        word_lookup = self.embed(word_input)
-        h = F.tanh(self.linear1(word_lookup))
+        h = F.tanh(self.linear1(self.pretrained(wordin)))
         logits = F.log(F.softplus(F.tanh(self.linear2(h))) + 1e-8)
         logits = logits.reshape((-1, self.M, self.num_centroids))
 
@@ -157,39 +166,36 @@ def train(args, save_dir=None, logger=None, progbar=True):
         train_acc: (float) final train set accuracy
         val_acc: (float) final validation set accuracy
     """
-    # Read data from directory and split to train/val set
-    data = np.load(args.data)
-    if n_word > 0:
-        data = data[:FLAGS.n_word]
-    batch_size = min(vocab_size, args.batch_size)
+    pretrained = np.load(args.pretrained)
+    if args.n_word > 0:
+        pretrained = pretrained[:args.n_word]
+    batch_size = min(pretrained.shape[0], args.batch_size)
     if logger:
-        logger.info("Read data from {:s}".format(args.data))
-        logger.debug("created train set of size {:d}".format(data.shape))
+        logger.info("Reading pretrained from {:s}".format(args.pretrained))
+        logger.debug("pretrained data of size {}".format(pretrained.shape))
         logger.debug("batch size = {:d}".format(batch_size))
 
-    # Construct EmbedQuantize model
     if logger:
         logger.info("Constructing EmbedQuantize model")
         logger.debug("M={:d}, K={}".format(args.M, args.K))
-    model = EmbedQuantize(data, args.M, args.K)
+    model = EmbedQuantize(pretrained, args.M, args.K)
 
     if args.cuda is not None:  # Enable GPU computation
         if logger:
             logger.info("Enabling CUDA Device {:d}".format(args.cuda))
         model.cuda(args.cuda)  # place at CUDA Device with specified ID
 
-    # create optimizer with current learning rate
     if logger:
         logger.info("Creating optimizer")
-        logger.debug("list of parameters: {}".format(
+        logger.debug("model parameters: {}".format(
             list(zip(*model.named_parameters()))[0]))
 
     if logger:
         logger.debug("Adam optimizer w/ lr={:.2e}".format(args.lr))
 
     # Create data loader
-    word_ids = list(range(vocab_size))
-    dataloader_train = DataLoader(
+    word_ids = list(range(pretrained.shape[0]))
+    dataloader = DataLoader(
         TensorDataset(torch.from_numpy(word_ids)),
         batch_size=batch_size,
         shuffle=True)
@@ -199,9 +205,9 @@ def train(args, save_dir=None, logger=None, progbar=True):
         shuffle=False)
 
     lr = args.lr  # adaptive learning rate
-    best_loss = np.inf
-    best_count = 0
-    loss = []  # record loss at end of each epoch
+    # best_loss = np.inf
+    # best_count = 0
+    train_loss = []  # record loss at end of each epoch
 
     for ep in range(args.epoch):
         if logger:
@@ -210,7 +216,7 @@ def train(args, save_dir=None, logger=None, progbar=True):
                     ep + 1, args.epoch))
 
         # wrap tqdm progress bar around dataloader if necessary
-        loader = tqdm(dataloader_train) if progbar else dataloader_train
+        loader = tqdm(dataloader) if progbar else dataloader
 
         model.train()  # set model to train mode
         batch_loss = []
@@ -219,12 +225,12 @@ def train(args, save_dir=None, logger=None, progbar=True):
                 x = x.cuda(args.cuda)
                 # y = y.cuda(args.cuda)
 
-            y, word_lookup, _ = model(Variable(x))
+            y, word_lookup, _ = model(Variable(x))  # forward pass
 
             loss = torch.sum((y - word_lookup)**2, dim=1).mean() / 2
             optimizer = optim.Adam(model.parameters(), lr=lr)  # Adam optimizer
-            optimizer.zero_grad()  # set Variables' gradient to zero
-            loss.backward()  # backward pass calculates gradients
+            optimizer.zero_grad()  # set gradients to zero
+            loss.backward()  # backward pass
             batch_loss.append(loss.data.cpu().numpy()[0])
             if progbar:  # update tqdm progress bar
                 loader.set_postfix(loss="{:2.2f}".format(batch_loss[-1]))
@@ -237,46 +243,46 @@ def train(args, save_dir=None, logger=None, progbar=True):
             logger.info("Epoch {:d}: loss = {:.3f}".format(
                 ep + 1, train_loss[-1]))
 
-        if save_dir:  # save model state
-            # Save at end of training or by frequency args.save_every
+        if save_dir:  # save model state by frequency and at end of training
             if (ep + 1) % args.save_every == 0 or ep == args.epoch - 1:
                 if logger:
-                    logger.info("Save model-state-{:04d}.pkl".format(ep + 1))
-                save_path = os.path.join(
-                    save_dir, "model-state-{:04d}.pkl".format(ep + 1))
-                torch.save(model.state_dict(), save_path)
-
+                    logger.info("Evaluating...")
                 model.eval()
-                quantised = np.zeros(data.shape)
+                codebook = model.codebook.reshape((args.M, 2**args.K, -1))
+                quantised = np.zeros_like(pretrained)
 
-                for x in loader:
+                for x in dataloader_no_shuf:
                     if args.cuda is not None:  # move to GPU
                         x = x.cuda(args.cuda)
                     _, _, logits = model(Variable(x))
 
-                    codebook = model.codebook.reshape((args.M, 2**args.K, -1))
                     for (i, w) in enumerate(x):
                         quantised[w] = sum(
                             codebook[m, np.argmax(logits[i, m])]
                             for m in range(args.M))
 
-                save_path = os.path.join(save_dir, "model-embed-loss.pkl")
+                if logger:
+                    logger.info("Save model-state-{:04d}.pkl".format(ep + 1))
+                save_path = os.path.join(
+                    save_dir, "model-state-{:04d}.pkl".format(ep + 1))
+                torch.save(model.state_dict(), save_path)
+                save_path = os.path.join(save_dir, "model-quan-loss.pkl")
                 pickle.dump((quantised, model.train_loss), open(
                     save_path, 'wb'))
 
-        if train_loss[-1] < best_loss * 0.99:
-            best_loss = train_loss[-1]
-            best_count = 0
-        else:
-            best_count += 1
-            if best_counter >= 100:
-                best_counter = 0
-                lr /= 2
-                if lr < 1.e-5:
-                    print('learning rate too small - stopping now')
-                    break
+        # if train_loss[-1] < best_loss * 0.99:
+        #     best_loss = train_loss[-1]
+        #     best_count = 0
+        # else:
+        #     best_count += 1
+        #     if best_counter >= 100:
+        #         best_counter = 0
+        #         lr /= 2
+        #         if lr < 1.e-5:
+        #             print('learning rate too small - stopping now')
+        #             break
 
-    return model, idx2elem, train_loss, train_acc, val_acc, neg_acc
+    return model, quantised, train_loss
 
 
 if __name__ == '__main__':
