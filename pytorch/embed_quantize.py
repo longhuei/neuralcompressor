@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.autograd import Variable
+from torch.utils.data import TensorDataset, DataLoader
 
 import numpy as np
 import pandas as pd
@@ -93,39 +94,37 @@ def gumbel_softmax(logits, temperature, hard=False):
 
 
 class EmbedQuantize(nn.Module):
-    def __init__(self, embedding_npy, M, K, param_init=0.01):
+    def __init__(self, pretrained, M, K, param_init=0.01):
         super(EmbedQuantize, self).__init__()
-        vocab_size = embedding_npy.shape[0]
-        emb_size = embedding_npy.shape[1]
-        self.M = M
-        self.num_centroids = 2**K
 
-        # self.pretrained = nn.Embedding.from_pretrained(embedding_npy, freeze=True)  # next version
-        self.pretrained = nn.Embedding(vocab_size, emb_size)
-        self.pretrained.weight.data = torch.from_numpy(embedding_npy)
+        # self.pretrained = nn.Embedding.from_pretrained(pretrained, freeze=True)  # next version
+        self.pretrained = nn.Embedding(*pretrained.shape)
+        self.pretrained.weight.data = torch.from_numpy(pretrained)
         self.pretrained.weight.requires_grad = False
-        self.codebook = nn.Embedding(M * self.num_centroids, emb_size)
-        self.linear1 = nn.Linear(emb_size, M * self.num_centroids / 2)
-        self.linear2 = nn.Linear(M * self.num_centroids / 2,
-                                 M * self.num_centroids)
 
-        nn.init.uniform_(self.embed.weight, a=-param_init, b=param_init)
-        nn.init.uniform_(self.codebook.weight, a=-param_init, b=param_init)
-        nn.init.uniform_(self.linear1.weight, a=-param_init, b=param_init)
-        nn.init.uniform_(self.linear1.bias, a=-param_init, b=param_init)
-        nn.init.uniform_(self.linear2.weight, a=-param_init, b=param_init)
-        nn.init.uniform_(self.linear1.bias, a=-param_init, b=param_init)
+        embed_dim = pretrained.shape[1]
+        self.linear1 = nn.Linear(embed_dim, int(M * K / 2))
+        self.linear2 = nn.Linear(int(M * K / 2), M * K)
+        self.codebook = nn.Linear(M * K, embed_dim)
 
-    def forward(self, wordin=np.array([3, 4, 5]), tau=1.):
+        # Uniform initialization
+        nn.init.uniform(self.pretrained.weight, a=-param_init, b=param_init)
+        nn.init.uniform(self.codebook.weight, a=-param_init, b=param_init)
+        nn.init.uniform(self.linear1.weight, a=-param_init, b=param_init)
+        nn.init.uniform(self.linear1.bias, a=-param_init, b=param_init)
+        nn.init.uniform(self.linear2.weight, a=-param_init, b=param_init)
+        nn.init.uniform(self.linear2.bias, a=-param_init, b=param_init)
+        nn.init.uniform(self.codebook.weight, a=-param_init, b=param_init)
+        nn.init.uniform(self.codebook.bias, a=-param_init, b=param_init)
+
+    def forward(self, ids=np.array([3, 4, 5]), tau=1.):
         tau -= 0.1
 
-        h = F.tanh(self.linear1(self.pretrained(wordin)))
-        logits = F.log(F.softplus(F.tanh(self.linear2(h))) + 1e-8)
-        logits = logits.reshape((-1, self.M, self.num_centroids))
-
-        D = gumbel_softmax(logits_lookup, tau, hard=False)
-        y = D.reshape(-1, M * num_centroids).matmul(A)
-        return y, word_lookup, logits
+        pretrained = self.pretrained(ids)
+        hidden = F.tanh(self.linear1(pretrained))
+        logits = F.log(F.softplus(F.tanh(self.linear2(hidden))) + 1e-8)
+        out = self.codebook(gumbel_softmax(logits, tau, hard=False))
+        return out, logits, pretrained
 
 
 def save_quantized():
@@ -194,15 +193,20 @@ def train(args, save_dir=None, logger=None, progbar=True):
         logger.debug("Adam optimizer w/ lr={:.2e}".format(args.lr))
 
     # Create data loader
-    word_ids = list(range(pretrained.shape[0]))
+    word_id = list(range(pretrained.shape[0]))
+    word_id_tensor = torch.from_numpy(np.array(word_id))
     dataloader = DataLoader(
-        TensorDataset(torch.from_numpy(word_ids)),
+        TensorDataset(word_id_tensor, word_id_tensor),
         batch_size=batch_size,
         shuffle=True)
     dataloader_no_shuf = DataLoader(
-        TensorDataset(torch.from_numpy(word_ids)),
+        TensorDataset(word_id_tensor, word_id_tensor),
         batch_size=batch_size,
         shuffle=False)
+
+    if progbar:  # wrap with tqdm progress bar
+        dataloader = tqdm(dataloader)
+        dataloader_no_shuf = tqdm(dataloader_no_shuf)
 
     lr = args.lr  # adaptive learning rate
     # best_loss = np.inf
@@ -215,19 +219,15 @@ def train(args, save_dir=None, logger=None, progbar=True):
                 "============ Epoch {:2d} of {:2d} ============".format(
                     ep + 1, args.epoch))
 
-        # wrap tqdm progress bar around dataloader if necessary
-        loader = tqdm(dataloader) if progbar else dataloader
-
         model.train()  # set model to train mode
         batch_loss = []
-        for x in loader:
+        for (x, y) in dataloader:
             if args.cuda is not None:  # move to GPU
                 x = x.cuda(args.cuda)
-                # y = y.cuda(args.cuda)
 
-            y, word_lookup, _ = model(Variable(x))  # forward pass
+            out, _, pretrained = model(Variable(x))  # forward pass
 
-            loss = torch.sum((y - word_lookup)**2, dim=1).mean() / 2
+            loss = torch.sum((out - pretrained)**2, dim=1).mean() / 2
             optimizer = optim.Adam(model.parameters(), lr=lr)  # Adam optimizer
             optimizer.zero_grad()  # set gradients to zero
             loss.backward()  # backward pass
@@ -248,13 +248,13 @@ def train(args, save_dir=None, logger=None, progbar=True):
                 if logger:
                     logger.info("Evaluating...")
                 model.eval()
-                codebook = model.codebook.reshape((args.M, 2**args.K, -1))
+                codebook = model.codebook.reshape((args.M, args.K, -1))
                 quantised = np.zeros_like(pretrained)
 
                 for x in dataloader_no_shuf:
                     if args.cuda is not None:  # move to GPU
                         x = x.cuda(args.cuda)
-                    _, _, logits = model(Variable(x))
+                    _, logits, _ = model(Variable(x))
 
                     for (i, w) in enumerate(x):
                         quantised[w] = sum(
