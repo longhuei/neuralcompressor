@@ -9,7 +9,7 @@ import numpy as np
 from tensorflow.python.ops.rnn_cell_impl import _linear
 
 tf.flags.DEFINE_integer('M', 32, "Number of subcodes.")
-tf.flags.DEFINE_integer('K', 16, "Number of vectors in each codebook.")
+tf.flags.DEFINE_integer('K', 4, "Number of vectors in each codebook.")
 
 tf.flags.DEFINE_integer('batch_size', 32, 'Batch size for computing embeddings')
 tf.flags.DEFINE_float('lr', 0.0001, "Learning rate.")
