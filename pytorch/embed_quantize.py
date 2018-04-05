@@ -20,6 +20,15 @@ import pickle
 
 class EmbedQuantize(nn.Module):
     def __init__(self, pretrained, M, K, param_init=0.01, cuda=None):
+        """Quantization of embeddings with composition.
+        
+        Arguments:
+            pretrained: (array) pretrained embeddings
+            M: (int) number of groups in cookbook
+            K: (int) number of centroids
+            param_init: (float) uniform initialization of parameters
+            cuda (int): which CUDA device to place the model params
+        """
         super(EmbedQuantize, self).__init__()
         self.M = M
         self.K = K
@@ -43,6 +52,12 @@ class EmbedQuantize(nn.Module):
         nn.init.uniform(self.codebook.weight, a=-param_init, b=param_init)
 
     def forward(self, wordin, tau=1.):
+        """Quantization of embeddings with composition.
+        
+        Arguments:
+            word: (array) list of word ids in batch
+            tau: (float) temperature for Gumbel softmax
+        """
         tau -= 0.1
 
         pretrained = self.pretrained(wordin)
@@ -55,6 +70,7 @@ class EmbedQuantize(nn.Module):
         return out, D, logits, pretrained
 
     def _gumbel_softmax(self, logits, temperature, eps=1e-20, hard=False):
+        """Gumbel softmax """
         U = torch.rand(logits.size())
         if self.cuda_device is not None:
             U = U.cuda(self.cuda_device)
@@ -85,9 +101,9 @@ def train(args, save_dir=None, logger=None, progbar=True):
 
     Returns:
         model: (EmbedQuantize) final model after training
-        train_loss: (float) final training loss
-        train_acc: (float) final train set accuracy
-        val_acc: (float) final validation set accuracy
+        quantized: (array) reconstructed quantized word embeddings
+        train_loss: (list) of training loss
+        train_pmax: (list) of training pmax
     """
     pretrained = np.load(args.pretrained)
     if args.n_word > 0:
@@ -222,7 +238,7 @@ def train(args, save_dir=None, logger=None, progbar=True):
         #             print('learning rate too small - stopping now')
         #             break
 
-    return model, quantised, train_loss
+    return model, quantised, train_loss, train_pmax
 
 
 if __name__ == '__main__':
