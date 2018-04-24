@@ -33,7 +33,7 @@ class EmbedQuantize(nn.Module):
         self.M = M
         self.K = K
         self.cuda_device = cuda
-        
+
         # self.pretrained = nn.Embedding.from_pretrained(pretrained, freeze=True)  # next version
         self.pretrained = nn.Embedding(*pretrained.shape)
         self.pretrained.weight.data = torch.from_numpy(pretrained)
@@ -111,7 +111,8 @@ def train(args, save_dir=None, logger=None, progbar=True):
     batch_size = min(pretrained.shape[0], args.batch_size)
     if logger:
         logger.info("Reading pretrained from {:s}".format(args.pretrained))
-        logger.debug("pretrained embedding of vocab={:d}, dim={:d}".format(pretrained.shape[0], pretrained.shape[1]))
+        logger.debug("pretrained embedding of vocab={:d}, dim={:d}".format(
+            pretrained.shape[0], pretrained.shape[1]))
         logger.debug("batch size = {:d}".format(batch_size))
 
     if logger:
@@ -223,8 +224,8 @@ def train(args, save_dir=None, logger=None, progbar=True):
                     save_dir, "model-state-{:04d}.pkl".format(ep + 1))
                 torch.save(model.state_dict(), save_path)
                 save_path = os.path.join(save_dir, "model-quan-loss.pkl")
-                pickle.dump((quantised, model.train_loss, model.train_pmax), open(
-                    save_path, 'wb'))
+                pickle.dump((quantised, model.train_loss, model.train_pmax),
+                            open(save_path, 'wb'))
 
         # if train_loss[-1] < best_loss * 0.99:
         #     best_loss = train_loss[-1]
@@ -246,7 +247,8 @@ if __name__ == '__main__':
     parser.add_argument('-M', type=int, default=32, help='number of subcodes')
     parser.add_argument(
         '-K', type=int, default=16, help='number of vectors in each codebook')
-    parser.add_argument('--tau', type=float, default=1., help='default temperature')
+    parser.add_argument(
+        '--tau', type=float, default=1., help='default temperature')
     parser.add_argument(
         '--epoch',
         metavar='EP',
@@ -275,7 +277,8 @@ if __name__ == '__main__':
         type=int,
         default=None,
         help='seed for random initialization')
-    parser.add_argument('--cuda', metavar='C', type=int, help='CUDA device to use')
+    parser.add_argument(
+        '--cuda', metavar='C', type=int, help='CUDA device to use')
     parser.add_argument(
         '--pretrained',
         metavar='P',
@@ -295,7 +298,7 @@ if __name__ == '__main__':
         default=50,
         help='epoch frequncy of saving model state to directory')
     args = parser.parse_args()
-    
+
     # Create log directory + file
     timestamp = strftime("%Y-%m-%d-%H%M%S")
     save_dir = os.path.join(args.save_dir, timestamp)
